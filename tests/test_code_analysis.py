@@ -61,6 +61,20 @@ class CodeAnalysisTests(unittest.TestCase):
         self.assertEqual(path.nodes[0], 'rust::runtime')
         self.assertEqual(path.nodes[-1], 'rust::runtime::session')
 
+    def test_rust_call_graph_traces_local_session_methods(self) -> None:
+        index = build_code_index()
+        callers = index.callers_of('rust::runtime::session::Session::append_persisted_message')
+        caller_names = {edge.caller for edge in callers}
+        self.assertIn('rust::runtime::session::Session::push_message', caller_names)
+
+        path = index.trace_path(
+            'rust::runtime::session::Session::push_user_text',
+            'rust::runtime::session::Session::append_persisted_message',
+        )
+        self.assertEqual(path.nodes[0], 'rust::runtime::session::Session::push_user_text')
+        self.assertEqual(path.nodes[-1], 'rust::runtime::session::Session::append_persisted_message')
+        self.assertIn('rust::runtime::session::Session::push_message', path.nodes)
+
     def test_code_analysis_json_outputs(self) -> None:
         index_result = subprocess.run(
             [sys.executable, '-m', 'src.main', 'code-index', '--json'],
@@ -92,16 +106,39 @@ class CodeAnalysisTests(unittest.TestCase):
             capture_output=True,
             text=True,
         )
+        rust_callers_result = subprocess.run(
+            [sys.executable, '-m', 'src.main', 'code-callers', 'rust::runtime::session::Session::append_persisted_message', '--json'],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        rust_trace_result = subprocess.run(
+            [
+                sys.executable,
+                '-m',
+                'src.main',
+                'code-trace',
+                'rust::runtime::session::Session::push_user_text',
+                'rust::runtime::session::Session::append_persisted_message',
+                '--json',
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
 
         index_payload = json.loads(index_result.stdout)
         symbols_payload = json.loads(symbols_result.stdout)
         callers_payload = json.loads(callers_result.stdout)
         import_trace_payload = json.loads(import_trace_result.stdout)
         graph_payload = json.loads(graph_result.stdout)
+        rust_callers_payload = json.loads(rust_callers_result.stdout)
+        rust_trace_payload = json.loads(rust_trace_result.stdout)
 
         self.assertIn('python', index_payload['summary']['languages'])
         self.assertIn('rust', index_payload['summary']['languages'])
         self.assertGreater(index_payload['summary']['languages']['rust']['symbols'], 0)
+        self.assertGreater(index_payload['summary']['languages']['rust']['call_edges'], 0)
         self.assertTrue(
             any(result['qualified_name'] == 'rust::runtime::session::Session' for result in symbols_payload['results'])
         )
@@ -111,6 +148,17 @@ class CodeAnalysisTests(unittest.TestCase):
         self.assertEqual(import_trace_payload['path']['nodes'][-1], 'rust::runtime::session')
         self.assertEqual(graph_payload['kind'], 'imports')
         self.assertTrue(any(edge['imported'] == 'rust::runtime::session' for edge in graph_payload['edges']))
+        self.assertTrue(
+            any(edge['caller'] == 'rust::runtime::session::Session::push_message' for edge in rust_callers_payload['callers'])
+        )
+        self.assertEqual(
+            rust_trace_payload['path']['nodes'][0],
+            'rust::runtime::session::Session::push_user_text',
+        )
+        self.assertEqual(
+            rust_trace_payload['path']['nodes'][-1],
+            'rust::runtime::session::Session::append_persisted_message',
+        )
 
     def test_code_analysis_clis_run(self) -> None:
         index_result = subprocess.run(
@@ -149,6 +197,19 @@ class CodeAnalysisTests(unittest.TestCase):
             capture_output=True,
             text=True,
         )
+        rust_trace_result = subprocess.run(
+            [
+                sys.executable,
+                '-m',
+                'src.main',
+                'code-trace',
+                'rust::runtime::session::Session::push_user_text',
+                'rust::runtime::session::Session::append_persisted_message',
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
         self.assertIn('Code Analysis Index', index_result.stdout)
         self.assertIn('- rust:', index_result.stdout)
         self.assertIn('src.query_engine.QueryEnginePort.submit_message', symbols_result.stdout)
@@ -159,3 +220,5 @@ class CodeAnalysisTests(unittest.TestCase):
         self.assertIn('rust::runtime::session', import_trace_result.stdout)
         self.assertIn('digraph imports {', graph_result.stdout)
         self.assertIn('"rust::runtime" -> "rust::runtime::session"', graph_result.stdout)
+        self.assertIn('rust::runtime::session::Session::push_user_text', rust_trace_result.stdout)
+        self.assertIn('rust::runtime::session::Session::append_persisted_message', rust_trace_result.stdout)

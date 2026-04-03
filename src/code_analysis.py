@@ -18,6 +18,10 @@ RUST_TRAIT_RE = re.compile(r'^(?:pub(?:\([^)]*\))?\s+)?trait\s+([A-Za-z_][A-Za-z
 RUST_FUNCTION_RE = re.compile(
     r'^(?:pub(?:\([^)]*\))?\s+)?(?:const\s+)?(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)'
 )
+RUST_CALL_RE = re.compile(r'([A-Za-z_][A-Za-z0-9_:.\']*)\s*\(')
+RUST_TYPED_LET_RE = re.compile(r'\blet\s+(?:mut\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*:\s*([^=;]+)')
+RUST_PATH_LET_RE = re.compile(r'\blet\s+(?:mut\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([A-Za-z_][A-Za-z0-9_:<>]*)')
+RUST_CONTROL_CALL_HEADS = {'if', 'for', 'loop', 'match', 'return', 'while'}
 
 
 @dataclass(frozen=True)
@@ -395,6 +399,14 @@ class _RustScope:
     depth: int
 
 
+@dataclass
+class _RustFunctionScope:
+    qualified_name: str
+    depth: int
+    owner_qname: str | None
+    local_types: dict[str, str]
+
+
 class _ImportAndSymbolCollector(ast.NodeVisitor):
     def __init__(self, module: str, is_package: bool) -> None:
         self.module = module
@@ -728,6 +740,15 @@ def _strip_rust_line_comment(line: str) -> str:
     return line.split('//', 1)[0]
 
 
+def _strip_rust_generics(value: str) -> str:
+    cleaned = value
+    while True:
+        updated = re.sub(r'::?<[^<>]*>', '', cleaned)
+        if updated == cleaned:
+            return updated
+        cleaned = updated
+
+
 def _parse_rust_impl_target(header: str) -> str | None:
     cleaned = header.split('{', 1)[0].split('where', 1)[0].strip()
     if ' for ' in cleaned:
@@ -742,6 +763,16 @@ def _parse_rust_impl_target(header: str) -> str | None:
     last_segment = segments[-1]
     match = re.search(r'([A-Za-z_][A-Za-z0-9_]*)', last_segment)
     return match.group(1) if match else None
+
+
+def _rust_source_files() -> list[Path]:
+    if not RUST_CRATES_ROOT.exists():
+        return []
+    return sorted(
+        path
+        for path in RUST_CRATES_ROOT.rglob('*.rs')
+        if 'src' in path.relative_to(RUST_CRATES_ROOT).parts
+    )
 
 
 def _build_python_index() -> tuple[list[CodeSymbol], list[ImportEdge], list[CallEdge]]:
@@ -787,14 +818,10 @@ def _build_python_index() -> tuple[list[CodeSymbol], list[ImportEdge], list[Call
 
 
 def _build_rust_index() -> tuple[list[CodeSymbol], list[ImportEdge]]:
-    if not RUST_CRATES_ROOT.exists():
+    rust_files = _rust_source_files()
+    if not rust_files:
         return [], []
 
-    rust_files = sorted(
-        path
-        for path in RUST_CRATES_ROOT.rglob('*.rs')
-        if 'src' in path.relative_to(RUST_CRATES_ROOT).parts
-    )
     workspace_crates = {path.name for path in RUST_CRATES_ROOT.iterdir() if path.is_dir()}
     module_names = {_rust_module_name_for_path(path) for path in rust_files}
 
@@ -951,10 +978,293 @@ def _build_rust_index() -> tuple[list[CodeSymbol], list[ImportEdge]]:
     return symbols, imports
 
 
+def _rust_alias_map(module: str, import_edges: list[ImportEdge]) -> dict[str, str]:
+    aliases: dict[str, str] = {}
+    for edge in import_edges:
+        if edge.importer != module or edge.language != 'rust':
+            continue
+        aliases[edge.imported.split('::')[-1]] = edge.imported
+    return aliases
+
+
+def _normalize_rust_symbol_reference(
+    current_module: str,
+    value: str,
+    alias_map: dict[str, str],
+    current_owner_qname: str | None,
+    module_names: set[str],
+    workspace_crates: set[str],
+    symbol_map: dict[str, CodeSymbol],
+) -> str | None:
+    cleaned = _strip_rust_generics(value).strip().lstrip('&').removeprefix('mut ').strip()
+    if not cleaned:
+        return None
+    if cleaned.startswith('Self::') and current_owner_qname:
+        candidate = f'{current_owner_qname}::{cleaned[6:]}'
+        return candidate if candidate in symbol_map else None
+    if cleaned in alias_map and alias_map[cleaned] in symbol_map:
+        return alias_map[cleaned]
+    if '::' in cleaned:
+        first_segment, remainder = cleaned.split('::', 1)
+        if first_segment in alias_map:
+            candidate = f'{alias_map[first_segment]}::{remainder}'
+            return candidate if candidate in symbol_map else None
+        candidate = _normalize_rust_use_target(current_module, cleaned, module_names, workspace_crates)
+        if candidate in symbol_map:
+            return candidate
+    same_module = f'{current_module}::{cleaned}'
+    if same_module in symbol_map:
+        return same_module
+    if current_owner_qname:
+        same_owner = f'{current_owner_qname}::{cleaned}'
+        if same_owner in symbol_map:
+            return same_owner
+    return None
+
+
+def _infer_rust_local_types(
+    current_module: str,
+    line: str,
+    alias_map: dict[str, str],
+    current_owner_qname: str | None,
+    module_names: set[str],
+    workspace_crates: set[str],
+    symbol_map: dict[str, CodeSymbol],
+    local_types: dict[str, str],
+) -> None:
+    typed_match = RUST_TYPED_LET_RE.search(line)
+    if typed_match:
+        resolved = _normalize_rust_symbol_reference(
+            current_module,
+            typed_match.group(2).strip(),
+            alias_map,
+            current_owner_qname,
+            module_names,
+            workspace_crates,
+            symbol_map,
+        )
+        if resolved:
+            local_types[typed_match.group(1)] = resolved
+
+    path_match = RUST_PATH_LET_RE.search(line)
+    if not path_match:
+        return
+    variable_name, type_candidate = path_match.groups()
+    normalized_candidate = _strip_rust_generics(type_candidate)
+    if normalized_candidate.endswith('::new') or normalized_candidate.endswith('::default'):
+        normalized_candidate = normalized_candidate.rsplit('::', 1)[0]
+    resolved = _normalize_rust_symbol_reference(
+        current_module,
+        normalized_candidate,
+        alias_map,
+        current_owner_qname,
+        module_names,
+        workspace_crates,
+        symbol_map,
+    )
+    if resolved:
+        local_types[variable_name] = resolved
+
+
+def _resolve_rust_call_target(
+    current_module: str,
+    raw_expr: str,
+    alias_map: dict[str, str],
+    current_owner_qname: str | None,
+    local_types: dict[str, str],
+    module_names: set[str],
+    workspace_crates: set[str],
+    symbol_map: dict[str, CodeSymbol],
+) -> str | None:
+    expr = _strip_rust_generics(raw_expr).strip()
+    if not expr:
+        return None
+    if expr in RUST_CONTROL_CALL_HEADS:
+        return None
+    if expr.startswith('self.') and current_owner_qname:
+        candidate = f'{current_owner_qname}::{expr.split(".", 1)[1]}'
+        return candidate if candidate in symbol_map else None
+    if '.' in expr:
+        base, method = expr.rsplit('.', 1)
+        if base in local_types:
+            candidate = f'{local_types[base]}::{method}'
+            return candidate if candidate in symbol_map else None
+        if base == 'self' and current_owner_qname:
+            candidate = f'{current_owner_qname}::{method}'
+            return candidate if candidate in symbol_map else None
+        return None
+    return _normalize_rust_symbol_reference(
+        current_module,
+        expr,
+        alias_map,
+        current_owner_qname,
+        module_names,
+        workspace_crates,
+        symbol_map,
+    )
+
+
+def _extract_rust_call_edges(
+    caller: str,
+    current_module: str,
+    line: str,
+    lineno: int,
+    alias_map: dict[str, str],
+    current_owner_qname: str | None,
+    local_types: dict[str, str],
+    module_names: set[str],
+    workspace_crates: set[str],
+    symbol_map: dict[str, CodeSymbol],
+) -> list[CallEdge]:
+    call_edges: list[CallEdge] = []
+    for match in RUST_CALL_RE.finditer(_strip_rust_generics(line)):
+        callee = _resolve_rust_call_target(
+            current_module=current_module,
+            raw_expr=match.group(1),
+            alias_map=alias_map,
+            current_owner_qname=current_owner_qname,
+            local_types=local_types,
+            module_names=module_names,
+            workspace_crates=workspace_crates,
+            symbol_map=symbol_map,
+        )
+        if callee:
+            call_edges.append(CallEdge(caller=caller, callee=callee, line=lineno, language='rust'))
+    return call_edges
+
+
+def _build_rust_call_edges(
+    rust_symbols: list[CodeSymbol],
+    rust_imports: list[ImportEdge],
+) -> list[CallEdge]:
+    rust_files = _rust_source_files()
+    if not rust_files:
+        return []
+
+    workspace_crates = {path.name for path in RUST_CRATES_ROOT.iterdir() if path.is_dir()}
+    module_names = {_rust_module_name_for_path(path) for path in rust_files}
+    symbol_map = {
+        symbol.qualified_name: symbol
+        for symbol in rust_symbols
+        if symbol.language == 'rust'
+    }
+    call_edges: list[CallEdge] = []
+
+    for path in rust_files:
+        module = _rust_module_name_for_path(path)
+        alias_map = _rust_alias_map(module, rust_imports)
+        lines = path.read_text().splitlines()
+        brace_depth = 0
+        scopes: list[_RustScope] = []
+        function_scopes: list[_RustFunctionScope] = []
+        pending_impl_target: str | None = None
+        pending_trait_name: str | None = None
+        pending_function: tuple[str, str | None] | None = None
+
+        for lineno, raw_line in enumerate(lines, start=1):
+            line = _strip_rust_line_comment(raw_line).strip()
+            if not line:
+                continue
+
+            trait_match = RUST_TRAIT_RE.match(line)
+            if trait_match:
+                trait_name = trait_match.group(1)
+                if '{' in line:
+                    scopes.append(_RustScope(name=trait_name, depth=brace_depth + line.count('{')))
+                else:
+                    pending_trait_name = trait_name
+
+            if line.startswith('impl ') or line.startswith('unsafe impl ') or line.startswith('default impl '):
+                impl_target = _parse_rust_impl_target(line)
+                if impl_target:
+                    if '{' in line:
+                        scopes.append(_RustScope(name=impl_target, depth=brace_depth + line.count('{')))
+                    else:
+                        pending_impl_target = impl_target
+
+            if pending_impl_target and '{' in line and not (
+                line.startswith('impl ') or line.startswith('unsafe impl ') or line.startswith('default impl ')
+            ):
+                scopes.append(_RustScope(name=pending_impl_target, depth=brace_depth + line.count('{')))
+                pending_impl_target = None
+
+            if pending_trait_name and '{' in line and not trait_match:
+                scopes.append(_RustScope(name=pending_trait_name, depth=brace_depth + line.count('{')))
+                pending_trait_name = None
+
+            function_match = RUST_FUNCTION_RE.match(line)
+            body_fragment = line
+            if function_match:
+                owner_qname = f'{module}::{scopes[-1].name}' if scopes else None
+                symbol_name = function_match.group(1)
+                function_qname = f'{owner_qname}::{symbol_name}' if owner_qname else f'{module}::{symbol_name}'
+                if '{' in line:
+                    function_scopes.append(
+                        _RustFunctionScope(
+                            qualified_name=function_qname,
+                            depth=brace_depth + line.count('{'),
+                            owner_qname=owner_qname,
+                            local_types={},
+                        )
+                    )
+                    body_fragment = line.split('{', 1)[1]
+                else:
+                    pending_function = (function_qname, owner_qname)
+                    body_fragment = ''
+            elif pending_function and '{' in line:
+                function_qname, owner_qname = pending_function
+                function_scopes.append(
+                    _RustFunctionScope(
+                        qualified_name=function_qname,
+                        depth=brace_depth + line.count('{'),
+                        owner_qname=owner_qname,
+                        local_types={},
+                    )
+                )
+                pending_function = None
+                body_fragment = line.split('{', 1)[1]
+
+            current_function = function_scopes[-1] if function_scopes else None
+            if current_function and body_fragment:
+                _infer_rust_local_types(
+                    current_module=module,
+                    line=body_fragment,
+                    alias_map=alias_map,
+                    current_owner_qname=current_function.owner_qname,
+                    module_names=module_names,
+                    workspace_crates=workspace_crates,
+                    symbol_map=symbol_map,
+                    local_types=current_function.local_types,
+                )
+                call_edges.extend(
+                    _extract_rust_call_edges(
+                        caller=current_function.qualified_name,
+                        current_module=module,
+                        line=body_fragment,
+                        lineno=lineno,
+                        alias_map=alias_map,
+                        current_owner_qname=current_function.owner_qname,
+                        local_types=current_function.local_types,
+                        module_names=module_names,
+                        workspace_crates=workspace_crates,
+                        symbol_map=symbol_map,
+                    )
+                )
+
+            brace_depth += line.count('{') - line.count('}')
+            while function_scopes and brace_depth < function_scopes[-1].depth:
+                function_scopes.pop()
+            while scopes and brace_depth < scopes[-1].depth:
+                scopes.pop()
+
+    return call_edges
+
+
 @lru_cache(maxsize=1)
 def build_code_index() -> CodeIndex:
     python_symbols, python_imports, python_calls = _build_python_index()
     rust_symbols, rust_imports = _build_rust_index()
+    rust_calls = _build_rust_call_edges(rust_symbols, rust_imports)
 
     all_symbols = python_symbols + rust_symbols
     deduped_symbols = sorted(
@@ -974,7 +1284,7 @@ def build_code_index() -> CodeIndex:
     deduped_calls = sorted(
         {
             (edge.caller, edge.callee, edge.line, edge.language): edge
-            for edge in python_calls
+            for edge in (python_calls + rust_calls)
         }.values(),
         key=lambda edge: (edge.language, edge.caller, edge.callee, edge.line),
     )
