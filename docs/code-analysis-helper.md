@@ -6,10 +6,10 @@ It is intentionally optimized for handoff and pressure-testing, not polished end
 ## Status
 
 - Branch: `feat/code-analysis-import-trace`
-- Latest helper commit at time of writing: `ab969b2`
 - Current scope:
   - Python AST-backed symbol index
   - Python call graph
+  - Python literal yield-event contract extraction
   - Rust symbol index
   - Rust import graph
   - Heuristic Rust local call graph
@@ -22,6 +22,7 @@ It is intentionally optimized for handoff and pressure-testing, not polished end
 - `python3 -m src.main code-symbols <query>`
 - `python3 -m src.main code-callers <symbol>`
 - `python3 -m src.main code-callees <symbol>`
+- `python3 -m src.main code-events <symbol>`
 - `python3 -m src.main code-trace <start> <target>`
 - `python3 -m src.main code-imports <module-or-symbol>`
 - `python3 -m src.main code-importers <module-or-symbol>`
@@ -38,6 +39,14 @@ It is intentionally optimized for handoff and pressure-testing, not polished end
   - The helper correctly shows it as an orchestration entrypoint.
 - `src.query_engine.QueryEnginePort.stream_submit_message`
   - The helper correctly shows it as a thin streaming wrapper over `submit_message`.
+  - It now extracts literal yielded event contracts:
+    - `message_start`
+    - `command_match`
+    - `tool_match`
+    - `permission_denial`
+    - `message_delta`
+    - `message_stop`
+  - Top-level keys are captured too, so the helper can distinguish lightweight deltas from terminal payloads.
 - `src.query_engine.QueryEnginePort.submit_message`
   - Initially under-modeled.
   - Now correctly resolves typed field-backed calls such as:
@@ -54,15 +63,9 @@ It is intentionally optimized for handoff and pressure-testing, not polished end
   - Modeled well enough for structural routing flow.
   - The helper correctly shows the two `_collect_matches(...)` calls.
   - Remaining weakness is in data-shaping semantics, not core call structure.
-- `src.query_engine.QueryEnginePort.stream_submit_message`
-  - Structural trace is correct: it yields some events, then delegates to `submit_message`.
-  - Current helper does not expose the yielded event contract as analysis output.
-  - Observed event types from a real run:
-    - `message_start`
-    - `command_match`
-    - `tool_match`
-    - `message_delta`
-    - `message_stop`
+- `src.query_engine.QueryEnginePort._render_structured_output`
+  - Structural call modeling is fine.
+  - The remaining gap here is retry/exception semantics, not missing call edges.
 
 ### Current examples
 
@@ -87,14 +90,23 @@ It is intentionally optimized for handoff and pressure-testing, not polished end
     - `src.runtime.PortRuntime._collect_matches`
     - `src.runtime.PortRuntime._collect_matches`
 
+- `python3 -m src.main code-events src.query_engine.QueryEnginePort.stream_submit_message`
+  - Expected structure:
+    - `message_start`
+    - `command_match`
+    - `tool_match`
+    - `permission_denial`
+    - `message_delta`
+    - `message_stop`
+
 ## Known Gaps
 
 - Python builtins and container mutations are still mostly opaque.
   - Example: `self.mutable_messages.append(...)` and `self.permission_denials.extend(...)` are not modeled as meaningful semantic edges.
 - Python data-shaping via comprehensions and builtins is only shallowly represented.
   - Examples: `sorted(...)`, `max(...)`, `list.pop(...)`, `list.append(...)`, and comprehension-heavy selection logic in `route_prompt()`.
-- Generator/event-schema understanding is missing.
-  - The helper can trace that `stream_submit_message` calls `submit_message`, but it does not model yielded event shapes as first-class analysis output.
+- Generator/event-schema understanding is only partial.
+  - Literal `yield {...}` contracts are now modeled, but delegated yields, computed payload schemas, and branch-conditioned event presence are not first-class yet.
 - Python control-flow and branch semantics are shallow.
   - We see callable edges, not branch conditions, dominance, or early-return structure.
 - Rust call graph is intentionally heuristic.
@@ -109,11 +121,11 @@ It is intentionally optimized for handoff and pressure-testing, not polished end
 - `src.runtime.PortRuntime.route_prompt`
 - `src.query_engine.QueryEnginePort._render_structured_output`
 - Rust runtime flows that cross module boundaries instead of staying within one impl block
-- Event-shape extraction for streaming generators
+- Generator methods that build payloads indirectly instead of yielding dict literals inline
 
 ## Likely Next Improvements
 
 - Add Python field-backed builtin/container mutation modeling where it is semantically useful.
-- Add a lightweight event-schema mode for generator methods that yield dict literals.
+- Extend the event-schema mode from literal dict yields to lightly computed payloads and conditional presence metadata.
 - Improve Rust cross-module call resolution using import aliases plus simple type propagation across more assignment patterns.
 - Add filtered graph export to files for Graphviz workflows if needed later.

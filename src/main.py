@@ -48,6 +48,10 @@ def build_parser() -> argparse.ArgumentParser:
     code_callees.add_argument('symbol')
     code_callees.add_argument('--json', action='store_true')
 
+    code_events = subparsers.add_parser('code-events', help='list discovered literal yield-event contracts for an indexed symbol')
+    code_events.add_argument('symbol')
+    code_events.add_argument('--json', action='store_true')
+
     code_imports = subparsers.add_parser('code-imports', help='list internal imports for an indexed module or symbol')
     code_imports.add_argument('module')
     code_imports.add_argument('--json', action='store_true')
@@ -248,6 +252,35 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         for edge in callees:
             print(f'- {edge.callee}:{edge.line}')
+        return 0
+    if args.command == 'code-events':
+        index = build_code_index()
+        try:
+            resolved = index.resolve_symbol(args.symbol)
+        except KeyError as exc:
+            print(str(exc))
+            return 1
+        events = index.events_of(resolved)
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        'symbol': resolved,
+                        'events': [event.to_dict() for event in events],
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+        print(f'Yield events of {resolved}:')
+        if not events:
+            print('none')
+            return 0
+        for event in events:
+            event_name = event.event_type or '<unknown>'
+            keys = ', '.join(event.keys)
+            print(f'- {event_name}:{event.line} keys=[{keys}]')
         return 0
     if args.command == 'code-imports':
         index = build_code_index()

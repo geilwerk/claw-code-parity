@@ -75,6 +75,24 @@ class ImportEdge:
 
 
 @dataclass(frozen=True)
+class YieldEvent:
+    producer: str
+    event_type: str | None
+    keys: tuple[str, ...]
+    line: int
+    language: str
+
+    def to_dict(self) -> dict[str, str | int | list[str] | None]:
+        return {
+            'producer': self.producer,
+            'event_type': self.event_type,
+            'keys': list(self.keys),
+            'line': self.line,
+            'language': self.language,
+        }
+
+
+@dataclass(frozen=True)
 class TracePath:
     nodes: tuple[str, ...]
 
@@ -92,6 +110,7 @@ class CodeIndex:
     symbols: tuple[CodeSymbol, ...]
     call_edges: tuple[CallEdge, ...]
     import_edges: tuple[ImportEdge, ...]
+    yield_events: tuple[YieldEvent, ...]
 
     def symbol_map(self) -> dict[str, CodeSymbol]:
         return {symbol.qualified_name: symbol for symbol in self.symbols}
@@ -163,6 +182,13 @@ class CodeIndex:
         return sorted(
             [edge for edge in self.call_edges if edge.caller == resolved],
             key=lambda edge: (edge.callee, edge.line),
+        )
+
+    def events_of(self, source: str) -> list[YieldEvent]:
+        resolved = self.resolve_symbol(source)
+        return sorted(
+            [event for event in self.yield_events if event.producer == resolved],
+            key=lambda event: (event.line, event.event_type or ''),
         )
 
     def imports_of(self, source: str, include_external: bool = False) -> list[ImportEdge]:
@@ -413,6 +439,7 @@ class CodeIndex:
         kind_counts: dict[str, int] = defaultdict(int)
         import_counts_by_language: dict[str, int] = defaultdict(int)
         call_counts_by_language: dict[str, int] = defaultdict(int)
+        event_counts_by_language: dict[str, int] = defaultdict(int)
 
         for symbol in self.symbols:
             modules_by_language[symbol.language].add(symbol.module)
@@ -426,11 +453,15 @@ class CodeIndex:
         for edge in self.call_edges:
             call_counts_by_language[edge.language] += 1
 
+        for event in self.yield_events:
+            event_counts_by_language[event.language] += 1
+
         languages = sorted(
             set(modules_by_language)
             | set(symbol_counts_by_language)
             | set(import_counts_by_language)
             | set(call_counts_by_language)
+            | set(event_counts_by_language)
         )
         language_breakdown = {
             language: {
@@ -438,6 +469,7 @@ class CodeIndex:
                 'symbols': symbol_counts_by_language[language],
                 'import_edges': import_counts_by_language[language],
                 'call_edges': call_counts_by_language[language],
+                'yield_events': event_counts_by_language[language],
             }
             for language in languages
         }
@@ -452,6 +484,7 @@ class CodeIndex:
             'kinds': dict(sorted(kind_counts.items())),
             'import_edges': len(self.import_edges),
             'call_edges': len(self.call_edges),
+            'yield_events': len(self.yield_events),
             'languages': language_breakdown,
             'top_callers': [
                 {'symbol': symbol_name, 'count': count}
@@ -465,6 +498,7 @@ class CodeIndex:
             'symbols': [symbol.to_dict() for symbol in self.symbols],
             'import_edges': [edge.to_dict() for edge in self.import_edges],
             'call_edges': [edge.to_dict() for edge in self.call_edges],
+            'yield_events': [event.to_dict() for event in self.yield_events],
         }
 
     def render_index_summary(self) -> str:
@@ -483,13 +517,15 @@ class CodeIndex:
             f"Methods: {kinds.get('method', 0)}",
             f"Import edges: {summary['import_edges']}",
             f"Call edges: {summary['call_edges']}",
+            f"Yield events: {summary['yield_events']}",
             '',
             'Language breakdown:',
         ]
         for language, values in summary['languages'].items():
             lines.append(
                 f"- {language}: modules={values['modules']} symbols={values['symbols']} "
-                f"import_edges={values['import_edges']} call_edges={values['call_edges']}"
+                f"import_edges={values['import_edges']} call_edges={values['call_edges']} "
+                f"yield_events={values['yield_events']}"
             )
         lines.extend(['', 'Top symbols by caller fan-out:'])
         for entry in summary['top_callers']:
@@ -630,6 +666,7 @@ class _CallCollector(ast.NodeVisitor):
         self.symbol_map = symbol_map
         self.class_field_types = class_field_types
         self.calls: list[CallEdge] = []
+        self.yield_events: list[YieldEvent] = []
         self.class_stack: list[str] = []
         self.function_stack: list[str] = []
         self.local_types_stack: list[dict[str, str]] = []
@@ -669,6 +706,16 @@ class _CallCollector(ast.NodeVisitor):
         callee = self._resolve_callable(node.func)
         if caller and callee:
             self.calls.append(CallEdge(caller=caller, callee=callee, line=node.lineno, language='python'))
+        self.generic_visit(node)
+
+    def visit_Yield(self, node: ast.Yield) -> None:
+        producer = self._current_caller()
+        event = self._extract_yield_event(producer, node)
+        if event:
+            self.yield_events.append(event)
+        self.generic_visit(node)
+
+    def visit_YieldFrom(self, node: ast.YieldFrom) -> None:
         self.generic_visit(node)
 
     def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
@@ -773,6 +820,29 @@ class _CallCollector(ast.NodeVisitor):
                 if isinstance(node.func.value, ast.Call):
                     return self._infer_instance_type(node.func.value)
         return None
+
+    def _extract_yield_event(self, producer: str | None, node: ast.Yield) -> YieldEvent | None:
+        if not producer or not isinstance(node.value, ast.Dict):
+            return None
+
+        keys: list[str] = []
+        event_type: str | None = None
+
+        for key_node, value_node in zip(node.value.keys, node.value.values):
+            if not isinstance(key_node, ast.Constant) or not isinstance(key_node.value, str):
+                return None
+            key = key_node.value
+            keys.append(key)
+            if key == 'type' and isinstance(value_node, ast.Constant) and isinstance(value_node.value, str):
+                event_type = value_node.value
+
+        return YieldEvent(
+            producer=producer,
+            event_type=event_type,
+            keys=tuple(keys),
+            line=node.lineno,
+            language='python',
+        )
 
 
 def _resolve_imported_module(current_module: str, is_package: bool, level: int, imported_module: str | None) -> str:
@@ -934,10 +1004,11 @@ def _rust_source_files() -> list[Path]:
     )
 
 
-def _build_python_index() -> tuple[list[CodeSymbol], list[ImportEdge], list[CallEdge]]:
+def _build_python_index() -> tuple[list[CodeSymbol], list[ImportEdge], list[CallEdge], list[YieldEvent]]:
     symbols: list[CodeSymbol] = []
     imports: list[ImportEdge] = []
     call_edges: list[CallEdge] = []
+    yield_events: list[YieldEvent] = []
     alias_maps: dict[str, dict[str, str]] = {}
     class_names: set[str] = set()
     class_field_types: dict[str, dict[str, str]] = {}
@@ -974,8 +1045,9 @@ def _build_python_index() -> tuple[list[CodeSymbol], list[ImportEdge], list[Call
         collector = _CallCollector(module, alias_maps[module], class_names, symbol_map, class_field_types)
         collector.visit(tree)
         call_edges.extend(collector.calls)
+        yield_events.extend(collector.yield_events)
 
-    return symbols, imports, call_edges
+    return symbols, imports, call_edges, yield_events
 
 
 def _build_rust_index() -> tuple[list[CodeSymbol], list[ImportEdge]]:
@@ -1423,7 +1495,7 @@ def _build_rust_call_edges(
 
 @lru_cache(maxsize=1)
 def build_code_index() -> CodeIndex:
-    python_symbols, python_imports, python_calls = _build_python_index()
+    python_symbols, python_imports, python_calls, python_yield_events = _build_python_index()
     rust_symbols, rust_imports = _build_rust_index()
     rust_calls = _build_rust_call_edges(rust_symbols, rust_imports)
 
@@ -1449,8 +1521,16 @@ def build_code_index() -> CodeIndex:
         }.values(),
         key=lambda edge: (edge.language, edge.caller, edge.callee, edge.line),
     )
+    deduped_yield_events = sorted(
+        {
+            (event.producer, event.event_type, event.keys, event.line, event.language): event
+            for event in python_yield_events
+        }.values(),
+        key=lambda event: (event.language, event.producer, event.line, event.event_type or ''),
+    )
     return CodeIndex(
         symbols=tuple(deduped_symbols),
         call_edges=tuple(deduped_calls),
         import_edges=tuple(deduped_imports),
+        yield_events=tuple(deduped_yield_events),
     )

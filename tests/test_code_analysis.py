@@ -51,6 +51,22 @@ class CodeAnalysisTests(unittest.TestCase):
         self.assertIn('src.query_engine.QueryEnginePort.submit_message', path.nodes)
         self.assertIn('src.query_engine.QueryEnginePort.compact_messages_if_needed', path.nodes)
 
+    def test_generator_event_contracts_are_discovered_for_literal_yields(self) -> None:
+        index = build_code_index()
+        events = index.events_of('src.query_engine.QueryEnginePort.stream_submit_message')
+        event_types = [event.event_type for event in events]
+        self.assertEqual(
+            event_types,
+            ['message_start', 'command_match', 'tool_match', 'permission_denial', 'message_delta', 'message_stop'],
+        )
+
+        stop_event = events[-1]
+        self.assertEqual(stop_event.event_type, 'message_stop')
+        self.assertEqual(
+            stop_event.keys,
+            ('type', 'usage', 'stop_reason', 'transcript_size'),
+        )
+
     def test_rust_symbols_and_imports_are_indexed(self) -> None:
         index = build_code_index()
         resolved = index.resolve_symbol('rust::runtime::session::Session')
@@ -152,6 +168,12 @@ class CodeAnalysisTests(unittest.TestCase):
             capture_output=True,
             text=True,
         )
+        events_result = subprocess.run(
+            [sys.executable, '-m', 'src.main', 'code-events', 'src.query_engine.QueryEnginePort.stream_submit_message', '--json'],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
         rust_callers_result = subprocess.run(
             [sys.executable, '-m', 'src.main', 'code-callers', 'rust::runtime::session::Session::append_persisted_message', '--json'],
             check=True,
@@ -219,6 +241,7 @@ class CodeAnalysisTests(unittest.TestCase):
         callers_payload = json.loads(callers_result.stdout)
         import_trace_payload = json.loads(import_trace_result.stdout)
         graph_payload = json.loads(graph_result.stdout)
+        events_payload = json.loads(events_result.stdout)
         rust_callers_payload = json.loads(rust_callers_result.stdout)
         python_state_callers_payload = json.loads(python_state_callers_result.stdout)
         rust_trace_payload = json.loads(rust_trace_result.stdout)
@@ -238,6 +261,9 @@ class CodeAnalysisTests(unittest.TestCase):
         self.assertEqual(import_trace_payload['path']['nodes'][-1], 'rust::runtime::session')
         self.assertEqual(graph_payload['kind'], 'imports')
         self.assertTrue(any(edge['imported'] == 'rust::runtime::session' for edge in graph_payload['edges']))
+        self.assertEqual(events_payload['symbol'], 'src.query_engine.QueryEnginePort.stream_submit_message')
+        self.assertEqual(events_payload['events'][0]['event_type'], 'message_start')
+        self.assertEqual(events_payload['events'][-1]['event_type'], 'message_stop')
         self.assertTrue(
             any(edge['caller'] == 'rust::runtime::session::Session::push_message' for edge in rust_callers_payload['callers'])
         )
@@ -306,6 +332,12 @@ class CodeAnalysisTests(unittest.TestCase):
             capture_output=True,
             text=True,
         )
+        events_result = subprocess.run(
+            [sys.executable, '-m', 'src.main', 'code-events', 'src.query_engine.QueryEnginePort.stream_submit_message'],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
         rust_trace_result = subprocess.run(
             [
                 sys.executable,
@@ -362,6 +394,8 @@ class CodeAnalysisTests(unittest.TestCase):
         self.assertIn('rust::runtime::session', import_trace_result.stdout)
         self.assertIn('digraph imports {', graph_result.stdout)
         self.assertIn('"rust::runtime" -> "rust::runtime::session"', graph_result.stdout)
+        self.assertIn('Yield events of src.query_engine.QueryEnginePort.stream_submit_message', events_result.stdout)
+        self.assertIn('message_stop', events_result.stdout)
         self.assertIn('rust::runtime::session::Session::push_user_text', rust_trace_result.stdout)
         self.assertIn('rust::runtime::session::Session::append_persisted_message', rust_trace_result.stdout)
         self.assertIn('src.query_engine.QueryEnginePort.stream_submit_message', python_state_trace_result.stdout)
