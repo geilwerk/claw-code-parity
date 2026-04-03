@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 
 from .bootstrap_graph import build_bootstrap_graph
+from .code_analysis import build_code_index
 from .command_graph import build_command_graph
 from .commands import execute_command, get_command, get_commands, render_command_index
 from .direct_modes import run_deep_link, run_direct_connect
@@ -28,8 +30,49 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser('command-graph', help='show command graph segmentation')
     subparsers.add_parser('tool-pool', help='show assembled tool pool with default settings')
     subparsers.add_parser('bootstrap-graph', help='show the mirrored bootstrap/runtime graph stages')
+    code_index = subparsers.add_parser('code-index', help='build a mixed Python/Rust symbol/import index for the porting workspace')
+    code_index.add_argument('--json', action='store_true')
     list_parser = subparsers.add_parser('subsystems', help='list the current Python modules in the workspace')
     list_parser.add_argument('--limit', type=int, default=32)
+
+    code_symbols = subparsers.add_parser('code-symbols', help='search indexed Python symbols')
+    code_symbols.add_argument('query')
+    code_symbols.add_argument('--limit', type=int, default=20)
+    code_symbols.add_argument('--json', action='store_true')
+
+    code_callers = subparsers.add_parser('code-callers', help='list callers of an indexed symbol')
+    code_callers.add_argument('symbol')
+    code_callers.add_argument('--json', action='store_true')
+
+    code_callees = subparsers.add_parser('code-callees', help='list callees of an indexed symbol')
+    code_callees.add_argument('symbol')
+    code_callees.add_argument('--json', action='store_true')
+
+    code_imports = subparsers.add_parser('code-imports', help='list internal imports for an indexed module or symbol')
+    code_imports.add_argument('module')
+    code_imports.add_argument('--json', action='store_true')
+    code_imports.add_argument('--external', action='store_true')
+
+    code_importers = subparsers.add_parser('code-importers', help='list internal importers for an indexed module or symbol')
+    code_importers.add_argument('module')
+    code_importers.add_argument('--json', action='store_true')
+    code_importers.add_argument('--external', action='store_true')
+
+    code_import_trace = subparsers.add_parser('code-import-trace', help='trace the shortest discovered import path between two indexed modules or symbols')
+    code_import_trace.add_argument('start')
+    code_import_trace.add_argument('target')
+    code_import_trace.add_argument('--json', action='store_true')
+
+    code_trace = subparsers.add_parser('code-trace', help='trace the shortest discovered call path between two indexed symbols')
+    code_trace.add_argument('start')
+    code_trace.add_argument('target')
+    code_trace.add_argument('--json', action='store_true')
+
+    code_graph = subparsers.add_parser('code-graph', help='export the discovered call or import graph')
+    code_graph.add_argument('kind', choices=['calls', 'imports'])
+    code_graph.add_argument('--scope', choices=['all', 'python', 'rust'], default='all')
+    code_graph.add_argument('--json', action='store_true')
+    code_graph.add_argument('--external', action='store_true')
 
     commands_parser = subparsers.add_parser('commands', help='list mirrored command entries from the archived snapshot')
     commands_parser.add_argument('--limit', type=int, default=20)
@@ -116,9 +159,213 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == 'bootstrap-graph':
         print(build_bootstrap_graph().as_markdown())
         return 0
+    if args.command == 'code-index':
+        index = build_code_index()
+        if args.json:
+            print(json.dumps(index.to_dict(), indent=2, sort_keys=True))
+        else:
+            print(index.render_index_summary())
+        return 0
     if args.command == 'subsystems':
         for subsystem in manifest.top_level_modules[: args.limit]:
             print(f'{subsystem.name}\t{subsystem.file_count}\t{subsystem.notes}')
+        return 0
+    if args.command == 'code-symbols':
+        index = build_code_index()
+        matches = index.find_symbols(args.query, limit=args.limit)
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        'query': args.query,
+                        'limit': args.limit,
+                        'results': [symbol.to_dict() for symbol in matches],
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+        if not matches:
+            print(f'No symbols matched: {args.query}')
+            return 0
+        for symbol in matches:
+            print(f'{symbol.qualified_name}\t{symbol.kind}\t{symbol.file_path}:{symbol.line}')
+        return 0
+    if args.command == 'code-callers':
+        index = build_code_index()
+        try:
+            resolved = index.resolve_symbol(args.symbol)
+        except KeyError as exc:
+            print(str(exc))
+            return 1
+        callers = index.callers_of(resolved)
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        'symbol': resolved,
+                        'callers': [edge.to_dict() for edge in callers],
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+        print(f'Callers of {resolved}:')
+        if not callers:
+            print('none')
+            return 0
+        for edge in callers:
+            print(f'- {edge.caller}:{edge.line}')
+        return 0
+    if args.command == 'code-callees':
+        index = build_code_index()
+        try:
+            resolved = index.resolve_symbol(args.symbol)
+        except KeyError as exc:
+            print(str(exc))
+            return 1
+        callees = index.callees_of(resolved)
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        'symbol': resolved,
+                        'callees': [edge.to_dict() for edge in callees],
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+        print(f'Callees of {resolved}:')
+        if not callees:
+            print('none')
+            return 0
+        for edge in callees:
+            print(f'- {edge.callee}:{edge.line}')
+        return 0
+    if args.command == 'code-imports':
+        index = build_code_index()
+        try:
+            resolved = index.resolve_module(args.module)
+        except KeyError as exc:
+            print(str(exc))
+            return 1
+        imports = index.imports_of(resolved, include_external=args.external)
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        'module': resolved,
+                        'imports': [edge.to_dict() for edge in imports],
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+        print(f'Imports of {resolved}:')
+        if not imports:
+            print('none')
+            return 0
+        for edge in imports:
+            print(f'- {edge.imported}')
+        return 0
+    if args.command == 'code-importers':
+        index = build_code_index()
+        try:
+            resolved = index.resolve_module(args.module)
+        except KeyError as exc:
+            print(str(exc))
+            return 1
+        importers = index.importers_of(resolved, include_external=args.external)
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        'module': resolved,
+                        'importers': [edge.to_dict() for edge in importers],
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+        print(f'Importers of {resolved}:')
+        if not importers:
+            print('none')
+            return 0
+        for edge in importers:
+            print(f'- {edge.importer}')
+        return 0
+    if args.command == 'code-import-trace':
+        index = build_code_index()
+        try:
+            path = index.trace_import_path(args.start, args.target)
+            start_module = index.resolve_module(args.start)
+            target_module = index.resolve_module(args.target)
+        except KeyError as exc:
+            print(str(exc))
+            return 1
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        'start': start_module,
+                        'target': target_module,
+                        'path': path.to_dict(),
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0 if path.nodes else 1
+        if not path.nodes:
+            print(f'No import path found between {args.start} and {args.target}.')
+            return 1
+        for line in path.as_lines():
+            print(line)
+        return 0
+    if args.command == 'code-trace':
+        index = build_code_index()
+        try:
+            path = index.trace_path(args.start, args.target)
+        except KeyError as exc:
+            print(str(exc))
+            return 1
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        'start': index.resolve_symbol(args.start),
+                        'target': index.resolve_symbol(args.target),
+                        'path': path.to_dict(),
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0 if path.nodes else 1
+        if not path.nodes:
+            print(f'No path found between {args.start} and {args.target}.')
+            return 1
+        for line in path.as_lines():
+            print(line)
+        return 0
+    if args.command == 'code-graph':
+        index = build_code_index()
+        if args.json:
+            print(
+                json.dumps(
+                    index.graph_payload(args.kind, scope=args.scope, include_external=args.external),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        else:
+            print(index.render_dot(args.kind, scope=args.scope, include_external=args.external))
         return 0
     if args.command == 'commands':
         if args.query:
