@@ -50,6 +50,19 @@ It is intentionally optimized for handoff and pressure-testing, not polished end
     - `src.runtime.PortRuntime.bootstrap_session`
     - `src.query_engine.QueryEnginePort.persist_session`
     - `src.session_store.save_session`
+- `src.runtime.PortRuntime.route_prompt`
+  - Modeled well enough for structural routing flow.
+  - The helper correctly shows the two `_collect_matches(...)` calls.
+  - Remaining weakness is in data-shaping semantics, not core call structure.
+- `src.query_engine.QueryEnginePort.stream_submit_message`
+  - Structural trace is correct: it yields some events, then delegates to `submit_message`.
+  - Current helper does not expose the yielded event contract as analysis output.
+  - Observed event types from a real run:
+    - `message_start`
+    - `command_match`
+    - `tool_match`
+    - `message_delta`
+    - `message_stop`
 
 ### Current examples
 
@@ -69,10 +82,17 @@ It is intentionally optimized for handoff and pressure-testing, not polished end
 - `python3 -m src.main code-graph calls --scope rust --focus rust::runtime::session::Session::push_user_text --depth 2 --direction out`
   - Produces a small, readable DOT subgraph instead of dumping the whole call graph.
 
+- `python3 -m src.main code-callees src.runtime.PortRuntime.route_prompt`
+  - Expected structure:
+    - `src.runtime.PortRuntime._collect_matches`
+    - `src.runtime.PortRuntime._collect_matches`
+
 ## Known Gaps
 
 - Python builtins and container mutations are still mostly opaque.
   - Example: `self.mutable_messages.append(...)` and `self.permission_denials.extend(...)` are not modeled as meaningful semantic edges.
+- Python data-shaping via comprehensions and builtins is only shallowly represented.
+  - Examples: `sorted(...)`, `max(...)`, `list.pop(...)`, `list.append(...)`, and comprehension-heavy selection logic in `route_prompt()`.
 - Generator/event-schema understanding is missing.
   - The helper can trace that `stream_submit_message` calls `submit_message`, but it does not model yielded event shapes as first-class analysis output.
 - Python control-flow and branch semantics are shallow.
