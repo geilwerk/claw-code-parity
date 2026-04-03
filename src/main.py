@@ -73,6 +73,9 @@ def build_parser() -> argparse.ArgumentParser:
     code_graph.add_argument('--scope', choices=['all', 'python', 'rust'], default='all')
     code_graph.add_argument('--json', action='store_true')
     code_graph.add_argument('--external', action='store_true')
+    code_graph.add_argument('--focus')
+    code_graph.add_argument('--depth', type=int, default=1)
+    code_graph.add_argument('--direction', choices=['both', 'in', 'out'], default='both')
 
     commands_parser = subparsers.add_parser('commands', help='list mirrored command entries from the archived snapshot')
     commands_parser.add_argument('--limit', type=int, default=20)
@@ -359,13 +362,29 @@ def main(argv: list[str] | None = None) -> int:
         if args.json:
             print(
                 json.dumps(
-                    index.graph_payload(args.kind, scope=args.scope, include_external=args.external),
+                    index.graph_payload(
+                        args.kind,
+                        scope=args.scope,
+                        include_external=args.external,
+                        focus=args.focus,
+                        max_depth=args.depth,
+                        direction=args.direction,
+                    ),
                     indent=2,
                     sort_keys=True,
                 )
             )
         else:
-            print(index.render_dot(args.kind, scope=args.scope, include_external=args.external))
+            print(
+                index.render_dot(
+                    args.kind,
+                    scope=args.scope,
+                    include_external=args.external,
+                    focus=args.focus,
+                    max_depth=args.depth,
+                    direction=args.direction,
+                )
+            )
         return 0
     if args.command == 'commands':
         if args.query:

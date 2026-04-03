@@ -253,11 +253,23 @@ class CodeIndex:
 
         return TracePath(nodes=())
 
-    def graph_payload(self, kind: str, scope: str = 'all', include_external: bool = False) -> dict[str, object]:
+    def graph_payload(
+        self,
+        kind: str,
+        scope: str = 'all',
+        include_external: bool = False,
+        focus: str | None = None,
+        max_depth: int = 1,
+        direction: str = 'both',
+    ) -> dict[str, object]:
         if kind not in {'imports', 'calls'}:
             raise ValueError(f'Unsupported graph kind: {kind}')
         if scope not in {'all', 'python', 'rust'}:
             raise ValueError(f'Unsupported graph scope: {scope}')
+        if max_depth < 0:
+            raise ValueError('max_depth must be >= 0')
+        if direction not in {'both', 'in', 'out'}:
+            raise ValueError(f'Unsupported graph direction: {direction}')
 
         if kind == 'calls':
             edges = [
@@ -266,9 +278,24 @@ class CodeIndex:
                 if scope == 'all' or edge.language == scope
             ]
             nodes = sorted({edge.caller for edge in edges} | {edge.callee for edge in edges})
+            resolved_focus = None
+            if focus:
+                resolved_focus = self.resolve_symbol(focus)
+                nodes, edges = self._filter_graph_edges(
+                    edges=edges,
+                    nodes=set(nodes),
+                    get_source=lambda edge: edge.caller,
+                    get_target=lambda edge: edge.callee,
+                    focus=resolved_focus,
+                    max_depth=max_depth,
+                    direction=direction,
+                )
             return {
                 'kind': kind,
                 'scope': scope,
+                'focus': resolved_focus,
+                'max_depth': max_depth if focus else None,
+                'direction': direction if focus else None,
                 'nodes': [{'id': node} for node in nodes],
                 'edges': [edge.to_dict() for edge in edges],
             }
@@ -281,16 +308,46 @@ class CodeIndex:
             and (include_external or edge.imported in internal_modules)
         ]
         nodes = sorted({edge.importer for edge in edges} | {edge.imported for edge in edges})
+        resolved_focus = None
+        if focus:
+            resolved_focus = self.resolve_module(focus)
+            nodes, edges = self._filter_graph_edges(
+                edges=edges,
+                nodes=set(nodes),
+                get_source=lambda edge: edge.importer,
+                get_target=lambda edge: edge.imported,
+                focus=resolved_focus,
+                max_depth=max_depth,
+                direction=direction,
+            )
         return {
             'kind': kind,
             'scope': scope,
             'include_external': include_external,
+            'focus': resolved_focus,
+            'max_depth': max_depth if focus else None,
+            'direction': direction if focus else None,
             'nodes': [{'id': node} for node in nodes],
             'edges': [edge.to_dict() for edge in edges],
         }
 
-    def render_dot(self, kind: str, scope: str = 'all', include_external: bool = False) -> str:
-        payload = self.graph_payload(kind=kind, scope=scope, include_external=include_external)
+    def render_dot(
+        self,
+        kind: str,
+        scope: str = 'all',
+        include_external: bool = False,
+        focus: str | None = None,
+        max_depth: int = 1,
+        direction: str = 'both',
+    ) -> str:
+        payload = self.graph_payload(
+            kind=kind,
+            scope=scope,
+            include_external=include_external,
+            focus=focus,
+            max_depth=max_depth,
+            direction=direction,
+        )
         lines = [f'digraph {kind} {{', '  rankdir=LR;']
         for node in payload['nodes']:
             lines.append(f'  "{node["id"]}";')
@@ -302,6 +359,53 @@ class CodeIndex:
                 lines.append(f'  "{edge["importer"]}" -> "{edge["imported"]}"{label};')
         lines.append('}')
         return '\n'.join(lines)
+
+    def _filter_graph_edges(
+        self,
+        edges: list[CallEdge] | list[ImportEdge],
+        nodes: set[str],
+        get_source,
+        get_target,
+        focus: str,
+        max_depth: int,
+        direction: str,
+    ) -> tuple[list[str], list[CallEdge] | list[ImportEdge]]:
+        if focus not in nodes:
+            raise KeyError(f'Unknown graph focus: {focus}')
+
+        forward: dict[str, set[str]] = defaultdict(set)
+        reverse: dict[str, set[str]] = defaultdict(set)
+        for edge in edges:
+            source = get_source(edge)
+            target = get_target(edge)
+            forward[source].add(target)
+            reverse[target].add(source)
+
+        visited: set[str] = {focus}
+        queue: deque[tuple[str, int]] = deque([(focus, 0)])
+
+        while queue:
+            node, depth = queue.popleft()
+            if depth >= max_depth:
+                continue
+            neighbors: set[str] = set()
+            if direction in {'both', 'out'}:
+                neighbors.update(forward.get(node, ()))
+            if direction in {'both', 'in'}:
+                neighbors.update(reverse.get(node, ()))
+            for neighbor in sorted(neighbors):
+                if neighbor in visited:
+                    continue
+                visited.add(neighbor)
+                queue.append((neighbor, depth + 1))
+
+        filtered_edges = [
+            edge
+            for edge in edges
+            if get_source(edge) in visited and get_target(edge) in visited
+        ]
+        filtered_nodes = sorted(visited)
+        return filtered_nodes, filtered_edges
 
     def summary(self) -> dict[str, object]:
         modules_by_language: dict[str, set[str]] = defaultdict(set)

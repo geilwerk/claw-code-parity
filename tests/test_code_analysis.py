@@ -75,6 +75,33 @@ class CodeAnalysisTests(unittest.TestCase):
         self.assertEqual(path.nodes[-1], 'rust::runtime::session::Session::append_persisted_message')
         self.assertIn('rust::runtime::session::Session::push_message', path.nodes)
 
+    def test_graph_focus_limits_import_and_call_neighborhoods(self) -> None:
+        index = build_code_index()
+
+        import_graph = index.graph_payload(
+            'imports',
+            scope='rust',
+            focus='rust::runtime',
+            max_depth=1,
+            direction='out',
+        )
+        import_nodes = {node['id'] for node in import_graph['nodes']}
+        self.assertIn('rust::runtime', import_nodes)
+        self.assertIn('rust::runtime::session', import_nodes)
+        self.assertNotIn('rust::api', import_nodes)
+
+        call_graph = index.graph_payload(
+            'calls',
+            scope='rust',
+            focus='rust::runtime::session::Session::push_user_text',
+            max_depth=2,
+            direction='out',
+        )
+        call_nodes = {node['id'] for node in call_graph['nodes']}
+        self.assertIn('rust::runtime::session::Session::push_user_text', call_nodes)
+        self.assertIn('rust::runtime::session::Session::push_message', call_nodes)
+        self.assertIn('rust::runtime::session::Session::append_persisted_message', call_nodes)
+
     def test_code_analysis_json_outputs(self) -> None:
         index_result = subprocess.run(
             [sys.executable, '-m', 'src.main', 'code-index', '--json'],
@@ -126,6 +153,27 @@ class CodeAnalysisTests(unittest.TestCase):
             capture_output=True,
             text=True,
         )
+        focused_graph_result = subprocess.run(
+            [
+                sys.executable,
+                '-m',
+                'src.main',
+                'code-graph',
+                'calls',
+                '--scope',
+                'rust',
+                '--focus',
+                'rust::runtime::session::Session::push_user_text',
+                '--depth',
+                '2',
+                '--direction',
+                'out',
+                '--json',
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
 
         index_payload = json.loads(index_result.stdout)
         symbols_payload = json.loads(symbols_result.stdout)
@@ -134,6 +182,7 @@ class CodeAnalysisTests(unittest.TestCase):
         graph_payload = json.loads(graph_result.stdout)
         rust_callers_payload = json.loads(rust_callers_result.stdout)
         rust_trace_payload = json.loads(rust_trace_result.stdout)
+        focused_graph_payload = json.loads(focused_graph_result.stdout)
 
         self.assertIn('python', index_payload['summary']['languages'])
         self.assertIn('rust', index_payload['summary']['languages'])
@@ -158,6 +207,14 @@ class CodeAnalysisTests(unittest.TestCase):
         self.assertEqual(
             rust_trace_payload['path']['nodes'][-1],
             'rust::runtime::session::Session::append_persisted_message',
+        )
+        self.assertEqual(
+            focused_graph_payload['focus'],
+            'rust::runtime::session::Session::push_user_text',
+        )
+        self.assertEqual(focused_graph_payload['max_depth'], 2)
+        self.assertTrue(
+            any(node['id'] == 'rust::runtime::session::Session::append_persisted_message' for node in focused_graph_payload['nodes'])
         )
 
     def test_code_analysis_clis_run(self) -> None:
@@ -210,6 +267,26 @@ class CodeAnalysisTests(unittest.TestCase):
             capture_output=True,
             text=True,
         )
+        focused_graph_result = subprocess.run(
+            [
+                sys.executable,
+                '-m',
+                'src.main',
+                'code-graph',
+                'calls',
+                '--scope',
+                'rust',
+                '--focus',
+                'rust::runtime::session::Session::push_user_text',
+                '--depth',
+                '2',
+                '--direction',
+                'out',
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
         self.assertIn('Code Analysis Index', index_result.stdout)
         self.assertIn('- rust:', index_result.stdout)
         self.assertIn('src.query_engine.QueryEnginePort.submit_message', symbols_result.stdout)
@@ -222,3 +299,4 @@ class CodeAnalysisTests(unittest.TestCase):
         self.assertIn('"rust::runtime" -> "rust::runtime::session"', graph_result.stdout)
         self.assertIn('rust::runtime::session::Session::push_user_text', rust_trace_result.stdout)
         self.assertIn('rust::runtime::session::Session::append_persisted_message', rust_trace_result.stdout)
+        self.assertIn('"rust::runtime::session::Session::push_user_text" -> "rust::runtime::session::Session::push_message"', focused_graph_result.stdout)
