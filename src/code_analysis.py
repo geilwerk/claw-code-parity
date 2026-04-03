@@ -44,6 +44,22 @@ PYTHON_CONTAINER_METHOD_QNAMES = (
 )
 
 
+def _python_type_with_parameter(base_type: str, parameter_type: str | None) -> str:
+    if not parameter_type:
+        return base_type
+    return f'{base_type}[{parameter_type}]'
+
+
+def _python_base_type(type_name: str) -> str:
+    return type_name.split('[', 1)[0]
+
+
+def _python_container_parameter(type_name: str) -> str | None:
+    if '[' not in type_name or not type_name.endswith(']'):
+        return None
+    return type_name[type_name.find('[') + 1 : -1]
+
+
 @dataclass(frozen=True)
 class CodeSymbol:
     qualified_name: str
@@ -576,6 +592,7 @@ class _ImportAndSymbolCollector(ast.NodeVisitor):
         self.class_stack: list[str] = []
         self.class_names: set[str] = set()
         self.class_field_types: dict[str, dict[str, str]] = defaultdict(dict)
+        self.function_return_types: dict[str, str] = {}
         self.function_depth = 0
 
     def visit_Import(self, node: ast.Import) -> None:
@@ -647,6 +664,10 @@ class _ImportAndSymbolCollector(ast.NodeVisitor):
                 language='python',
             )
         )
+        if node.returns is not None:
+            resolved_return = self._resolve_annotation_type(node.returns)
+            if resolved_return:
+                self.function_return_types[qname] = resolved_return
 
     def _resolve_annotation_type(self, node: ast.AST) -> str | None:
         if isinstance(node, ast.Name):
@@ -658,7 +679,22 @@ class _ImportAndSymbolCollector(ast.NodeVisitor):
                 return PYTHON_BUILTIN_QNAMES[node.value]
             return self.aliases.get(node.value, f'{self.module}.{node.value}')
         if isinstance(node, ast.Subscript):
-            return self._resolve_annotation_type(node.value)
+            base_type = self._resolve_annotation_type(node.value)
+            if base_type is None:
+                return None
+            base_root = _python_base_type(base_type)
+            if base_root == PYTHON_BUILTIN_QNAMES['dict']:
+                parameter_type: str | None = None
+                if isinstance(node.slice, ast.Tuple) and len(node.slice.elts) >= 2:
+                    parameter_type = self._resolve_annotation_type(node.slice.elts[1])
+                return _python_type_with_parameter(base_root, parameter_type)
+            if base_root in {
+                PYTHON_BUILTIN_QNAMES['list'],
+                PYTHON_BUILTIN_QNAMES['set'],
+            }:
+                parameter_type = self._resolve_annotation_type(node.slice)
+                return _python_type_with_parameter(base_root, parameter_type)
+            return base_type
         if isinstance(node, ast.Attribute):
             parts: list[str] = []
             current: ast.AST | None = node
@@ -683,12 +719,14 @@ class _CallCollector(ast.NodeVisitor):
         class_names: set[str],
         symbol_map: dict[str, CodeSymbol],
         class_field_types: dict[str, dict[str, str]],
+        function_return_types: dict[str, str],
     ) -> None:
         self.module = module
         self.aliases = aliases
         self.class_names = class_names
         self.symbol_map = symbol_map
         self.class_field_types = class_field_types
+        self.function_return_types = function_return_types
         self.calls: list[CallEdge] = []
         self.yield_events: list[YieldEvent] = []
         self.class_stack: list[str] = []
@@ -789,7 +827,22 @@ class _CallCollector(ast.NodeVisitor):
                 return PYTHON_BUILTIN_QNAMES[node.value]
             return self.aliases.get(node.value, f'{self.module}.{node.value}')
         if isinstance(node, ast.Subscript):
-            return self._resolve_annotation_type(node.value)
+            base_type = self._resolve_annotation_type(node.value)
+            if base_type is None:
+                return None
+            base_root = _python_base_type(base_type)
+            if base_root == PYTHON_BUILTIN_QNAMES['dict']:
+                parameter_type: str | None = None
+                if isinstance(node.slice, ast.Tuple) and len(node.slice.elts) >= 2:
+                    parameter_type = self._resolve_annotation_type(node.slice.elts[1])
+                return _python_type_with_parameter(base_root, parameter_type)
+            if base_root in {
+                PYTHON_BUILTIN_QNAMES['list'],
+                PYTHON_BUILTIN_QNAMES['set'],
+            }:
+                parameter_type = self._resolve_annotation_type(node.slice)
+                return _python_type_with_parameter(base_root, parameter_type)
+            return base_type
         if isinstance(node, ast.Attribute):
             parts: list[str] = []
             current: ast.AST | None = node
@@ -847,17 +900,24 @@ class _CallCollector(ast.NodeVisitor):
             if isinstance(node.value, ast.Name):
                 base = self._resolve_name(node.value.id)
                 if base:
+                    base_root = _python_base_type(base)
+                    if base_root in PYTHON_BUILTIN_QNAMES.values():
+                        candidate = f'{base_root}.{node.attr}'
+                        if candidate in self.symbol_map:
+                            return candidate
                     return f'{base}.{node.attr}'
 
             if isinstance(node.value, ast.Call):
                 instance_type = self._infer_instance_type(node.value)
                 if instance_type:
-                    candidate = f'{instance_type}.{node.attr}'
+                    candidate_owner = _python_base_type(instance_type)
+                    candidate = f'{candidate_owner}.{node.attr}'
                     return candidate if candidate in self.symbol_map else None
 
             instance_type = self._infer_instance_type(node.value)
             if instance_type:
-                candidate = f'{instance_type}.{node.attr}'
+                candidate_owner = _python_base_type(instance_type)
+                candidate = f'{candidate_owner}.{node.attr}'
                 if candidate in self.symbol_map:
                     return candidate
 
@@ -866,19 +926,42 @@ class _CallCollector(ast.NodeVisitor):
     def _infer_instance_type(self, node: ast.AST) -> str | None:
         if isinstance(node, ast.List | ast.ListComp):
             return PYTHON_BUILTIN_QNAMES['list']
-        if isinstance(node, ast.Dict | ast.DictComp):
+        if isinstance(node, ast.Dict):
+            value_types = {
+                inferred
+                for inferred in (self._infer_instance_type(value) for value in node.values)
+                if inferred is not None
+            }
+            if len(value_types) == 1:
+                return _python_type_with_parameter(PYTHON_BUILTIN_QNAMES['dict'], next(iter(value_types)))
             return PYTHON_BUILTIN_QNAMES['dict']
+        if isinstance(node, ast.DictComp):
+            value_type = self._infer_instance_type(node.value)
+            return _python_type_with_parameter(PYTHON_BUILTIN_QNAMES['dict'], value_type)
         if isinstance(node, ast.Set | ast.SetComp):
             return PYTHON_BUILTIN_QNAMES['set']
+        if isinstance(node, ast.Subscript):
+            base_type = self._infer_instance_type(node.value)
+            if base_type:
+                base_root = _python_base_type(base_type)
+                if base_root == PYTHON_BUILTIN_QNAMES['dict']:
+                    return _python_container_parameter(base_type)
         if isinstance(node, ast.Name):
             resolved = self._resolve_name(node.id)
             if resolved in self.class_names:
                 return resolved
             if resolved in PYTHON_BUILTIN_QNAMES.values():
                 return resolved
+            if resolved and _python_base_type(resolved) in PYTHON_BUILTIN_QNAMES.values():
+                return resolved
             return None
 
         if isinstance(node, ast.Call):
+            resolved_callable = self._resolve_callable(node.func)
+            if resolved_callable:
+                return_type = self.function_return_types.get(resolved_callable)
+                if return_type:
+                    return return_type
             if isinstance(node.func, ast.Name):
                 resolved = self._resolve_name(node.func.id)
                 if resolved in self.class_names:
@@ -1100,6 +1183,7 @@ def _build_python_index() -> tuple[list[CodeSymbol], list[ImportEdge], list[Call
     alias_maps: dict[str, dict[str, str]] = {}
     class_names: set[str] = set()
     class_field_types: dict[str, dict[str, str]] = {}
+    function_return_types: dict[str, str] = {}
 
     python_files = sorted(path for path in PACKAGE_ROOT.rglob('*.py') if '__pycache__' not in path.parts)
     parsed_trees: dict[str, tuple[Path, ast.AST]] = {}
@@ -1113,6 +1197,7 @@ def _build_python_index() -> tuple[list[CodeSymbol], list[ImportEdge], list[Call
         alias_maps[module] = collector.aliases
         class_names.update(collector.class_names)
         class_field_types.update(collector.class_field_types)
+        function_return_types.update(collector.function_return_types)
         for symbol in collector.symbols:
             symbols.append(
                 CodeSymbol(
@@ -1130,7 +1215,14 @@ def _build_python_index() -> tuple[list[CodeSymbol], list[ImportEdge], list[Call
     symbol_map = {symbol.qualified_name: symbol for symbol in symbols}
 
     for module, (_, tree) in parsed_trees.items():
-        collector = _CallCollector(module, alias_maps[module], class_names, symbol_map, class_field_types)
+        collector = _CallCollector(
+            module,
+            alias_maps[module],
+            class_names,
+            symbol_map,
+            class_field_types,
+            function_return_types,
+        )
         collector.visit(tree)
         call_edges.extend(collector.calls)
         yield_events.extend(collector.yield_events)

@@ -75,6 +75,7 @@ class CodeAnalysisTests(unittest.TestCase):
         self.assertIn('python.builtins.max', callees)
         self.assertIn('python.builtins.list.append', callees)
         self.assertIn('python.builtins.list.extend', callees)
+        self.assertIn('python.builtins.list.pop', callees)
 
     def test_rust_symbols_and_imports_are_indexed(self) -> None:
         index = build_code_index()
