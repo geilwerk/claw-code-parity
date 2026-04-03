@@ -32,6 +32,25 @@ class CodeAnalysisTests(unittest.TestCase):
         self.assertIn('src.runtime.PortRuntime.bootstrap_session', caller_names)
         self.assertIn('src.runtime.PortRuntime.run_turn_loop', caller_names)
 
+    def test_python_field_type_resolution_finds_query_engine_state_calls(self) -> None:
+        index = build_code_index()
+
+        submit_callees = {edge.callee for edge in index.callees_of('src.query_engine.QueryEnginePort.submit_message')}
+        self.assertIn('src.models.UsageSummary.add_turn', submit_callees)
+        self.assertIn('src.transcript.TranscriptStore.append', submit_callees)
+
+        compact_callees = {edge.callee for edge in index.callees_of('src.query_engine.QueryEnginePort.compact_messages_if_needed')}
+        self.assertIn('src.transcript.TranscriptStore.compact', compact_callees)
+
+        path = index.trace_path(
+            'src.query_engine.QueryEnginePort.stream_submit_message',
+            'src.transcript.TranscriptStore.compact',
+        )
+        self.assertEqual(path.nodes[0], 'src.query_engine.QueryEnginePort.stream_submit_message')
+        self.assertEqual(path.nodes[-1], 'src.transcript.TranscriptStore.compact')
+        self.assertIn('src.query_engine.QueryEnginePort.submit_message', path.nodes)
+        self.assertIn('src.query_engine.QueryEnginePort.compact_messages_if_needed', path.nodes)
+
     def test_rust_symbols_and_imports_are_indexed(self) -> None:
         index = build_code_index()
         resolved = index.resolve_symbol('rust::runtime::session::Session')
@@ -139,6 +158,12 @@ class CodeAnalysisTests(unittest.TestCase):
             capture_output=True,
             text=True,
         )
+        python_state_callers_result = subprocess.run(
+            [sys.executable, '-m', 'src.main', 'code-callers', 'src.transcript.TranscriptStore.compact', '--json'],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
         rust_trace_result = subprocess.run(
             [
                 sys.executable,
@@ -147,6 +172,20 @@ class CodeAnalysisTests(unittest.TestCase):
                 'code-trace',
                 'rust::runtime::session::Session::push_user_text',
                 'rust::runtime::session::Session::append_persisted_message',
+                '--json',
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        python_state_trace_result = subprocess.run(
+            [
+                sys.executable,
+                '-m',
+                'src.main',
+                'code-trace',
+                'src.query_engine.QueryEnginePort.stream_submit_message',
+                'src.transcript.TranscriptStore.compact',
                 '--json',
             ],
             check=True,
@@ -181,7 +220,9 @@ class CodeAnalysisTests(unittest.TestCase):
         import_trace_payload = json.loads(import_trace_result.stdout)
         graph_payload = json.loads(graph_result.stdout)
         rust_callers_payload = json.loads(rust_callers_result.stdout)
+        python_state_callers_payload = json.loads(python_state_callers_result.stdout)
         rust_trace_payload = json.loads(rust_trace_result.stdout)
+        python_state_trace_payload = json.loads(python_state_trace_result.stdout)
         focused_graph_payload = json.loads(focused_graph_result.stdout)
 
         self.assertIn('python', index_payload['summary']['languages'])
@@ -200,6 +241,9 @@ class CodeAnalysisTests(unittest.TestCase):
         self.assertTrue(
             any(edge['caller'] == 'rust::runtime::session::Session::push_message' for edge in rust_callers_payload['callers'])
         )
+        self.assertTrue(
+            any(edge['caller'] == 'src.query_engine.QueryEnginePort.compact_messages_if_needed' for edge in python_state_callers_payload['callers'])
+        )
         self.assertEqual(
             rust_trace_payload['path']['nodes'][0],
             'rust::runtime::session::Session::push_user_text',
@@ -207,6 +251,14 @@ class CodeAnalysisTests(unittest.TestCase):
         self.assertEqual(
             rust_trace_payload['path']['nodes'][-1],
             'rust::runtime::session::Session::append_persisted_message',
+        )
+        self.assertEqual(
+            python_state_trace_payload['path']['nodes'][0],
+            'src.query_engine.QueryEnginePort.stream_submit_message',
+        )
+        self.assertEqual(
+            python_state_trace_payload['path']['nodes'][-1],
+            'src.transcript.TranscriptStore.compact',
         )
         self.assertEqual(
             focused_graph_payload['focus'],
@@ -267,6 +319,19 @@ class CodeAnalysisTests(unittest.TestCase):
             capture_output=True,
             text=True,
         )
+        python_state_trace_result = subprocess.run(
+            [
+                sys.executable,
+                '-m',
+                'src.main',
+                'code-trace',
+                'src.query_engine.QueryEnginePort.stream_submit_message',
+                'src.transcript.TranscriptStore.compact',
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
         focused_graph_result = subprocess.run(
             [
                 sys.executable,
@@ -299,4 +364,6 @@ class CodeAnalysisTests(unittest.TestCase):
         self.assertIn('"rust::runtime" -> "rust::runtime::session"', graph_result.stdout)
         self.assertIn('rust::runtime::session::Session::push_user_text', rust_trace_result.stdout)
         self.assertIn('rust::runtime::session::Session::append_persisted_message', rust_trace_result.stdout)
+        self.assertIn('src.query_engine.QueryEnginePort.stream_submit_message', python_state_trace_result.stdout)
+        self.assertIn('src.transcript.TranscriptStore.compact', python_state_trace_result.stdout)
         self.assertIn('"rust::runtime::session::Session::push_user_text" -> "rust::runtime::session::Session::push_message"', focused_graph_result.stdout)

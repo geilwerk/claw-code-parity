@@ -519,6 +519,8 @@ class _ImportAndSymbolCollector(ast.NodeVisitor):
         self.symbols: list[CodeSymbol] = []
         self.class_stack: list[str] = []
         self.class_names: set[str] = set()
+        self.class_field_types: dict[str, dict[str, str]] = defaultdict(dict)
+        self.function_depth = 0
 
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
@@ -552,13 +554,25 @@ class _ImportAndSymbolCollector(ast.NodeVisitor):
         self.generic_visit(node)
         self.class_stack.pop()
 
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        if self.class_stack and self.function_depth == 0 and isinstance(node.target, ast.Name):
+            class_qname = f'{self.module}.{".".join(self.class_stack)}'
+            resolved_type = self._resolve_annotation_type(node.annotation)
+            if resolved_type:
+                self.class_field_types[class_qname][node.target.id] = resolved_type
+        self.generic_visit(node)
+
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self._record_function(node)
+        self.function_depth += 1
         self.generic_visit(node)
+        self.function_depth -= 1
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
         self._record_function(node)
+        self.function_depth += 1
         self.generic_visit(node)
+        self.function_depth -= 1
 
     def _record_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
         if self.class_stack:
@@ -578,6 +592,28 @@ class _ImportAndSymbolCollector(ast.NodeVisitor):
             )
         )
 
+    def _resolve_annotation_type(self, node: ast.AST) -> str | None:
+        if isinstance(node, ast.Name):
+            return self.aliases.get(node.id, f'{self.module}.{node.id}')
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return self.aliases.get(node.value, f'{self.module}.{node.value}')
+        if isinstance(node, ast.Subscript):
+            return self._resolve_annotation_type(node.value)
+        if isinstance(node, ast.Attribute):
+            parts: list[str] = []
+            current: ast.AST | None = node
+            while isinstance(current, ast.Attribute):
+                parts.append(current.attr)
+                current = current.value
+            if isinstance(current, ast.Name):
+                parts.append(current.id)
+                dotted = '.'.join(reversed(parts))
+                head, _, tail = dotted.partition('.')
+                if head in self.aliases:
+                    return f'{self.aliases[head]}.{tail}' if tail else self.aliases[head]
+                return dotted
+        return None
+
 
 class _CallCollector(ast.NodeVisitor):
     def __init__(
@@ -586,11 +622,13 @@ class _CallCollector(ast.NodeVisitor):
         aliases: dict[str, str],
         class_names: set[str],
         symbol_map: dict[str, CodeSymbol],
+        class_field_types: dict[str, dict[str, str]],
     ) -> None:
         self.module = module
         self.aliases = aliases
         self.class_names = class_names
         self.symbol_map = symbol_map
+        self.class_field_types = class_field_types
         self.calls: list[CallEdge] = []
         self.class_stack: list[str] = []
         self.function_stack: list[str] = []
@@ -660,6 +698,12 @@ class _CallCollector(ast.NodeVisitor):
                 return scope[name]
         return None
 
+    def _lookup_class_field_type(self, name: str) -> str | None:
+        class_qname = self._current_class_qname()
+        if not class_qname:
+            return None
+        return self.class_field_types.get(class_qname, {}).get(name)
+
     def _resolve_name(self, name: str) -> str | None:
         local_type = self._lookup_local_type(name)
         if local_type:
@@ -685,6 +729,17 @@ class _CallCollector(ast.NodeVisitor):
                 class_qname = self._current_class_qname()
                 if class_qname:
                     return f'{class_qname}.{node.attr}'
+
+            if (
+                isinstance(node.value, ast.Attribute)
+                and isinstance(node.value.value, ast.Name)
+                and node.value.value.id == 'self'
+            ):
+                field_type = self._lookup_class_field_type(node.value.attr)
+                if field_type:
+                    candidate = f'{field_type}.{node.attr}'
+                    if candidate in self.symbol_map:
+                        return candidate
 
             if isinstance(node.value, ast.Name):
                 base = self._resolve_name(node.value.id)
@@ -885,6 +940,7 @@ def _build_python_index() -> tuple[list[CodeSymbol], list[ImportEdge], list[Call
     call_edges: list[CallEdge] = []
     alias_maps: dict[str, dict[str, str]] = {}
     class_names: set[str] = set()
+    class_field_types: dict[str, dict[str, str]] = {}
 
     python_files = sorted(path for path in PACKAGE_ROOT.rglob('*.py') if '__pycache__' not in path.parts)
     parsed_trees: dict[str, tuple[Path, ast.AST]] = {}
@@ -897,6 +953,7 @@ def _build_python_index() -> tuple[list[CodeSymbol], list[ImportEdge], list[Call
         collector.visit(tree)
         alias_maps[module] = collector.aliases
         class_names.update(collector.class_names)
+        class_field_types.update(collector.class_field_types)
         for symbol in collector.symbols:
             symbols.append(
                 CodeSymbol(
@@ -914,7 +971,7 @@ def _build_python_index() -> tuple[list[CodeSymbol], list[ImportEdge], list[Call
     symbol_map = {symbol.qualified_name: symbol for symbol in symbols}
 
     for module, (_, tree) in parsed_trees.items():
-        collector = _CallCollector(module, alias_maps[module], class_names, symbol_map)
+        collector = _CallCollector(module, alias_maps[module], class_names, symbol_map, class_field_types)
         collector.visit(tree)
         call_edges.extend(collector.calls)
 
