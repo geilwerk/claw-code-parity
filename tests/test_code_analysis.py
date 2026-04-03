@@ -67,6 +67,15 @@ class CodeAnalysisTests(unittest.TestCase):
             ('type', 'usage', 'stop_reason', 'transcript_size'),
         )
 
+    def test_route_prompt_exposes_builtin_selection_ops(self) -> None:
+        index = build_code_index()
+        callees = {edge.callee for edge in index.callees_of('src.runtime.PortRuntime.route_prompt')}
+        self.assertIn('src.runtime.PortRuntime._collect_matches', callees)
+        self.assertIn('python.builtins.sorted', callees)
+        self.assertIn('python.builtins.max', callees)
+        self.assertIn('python.builtins.list.append', callees)
+        self.assertIn('python.builtins.list.extend', callees)
+
     def test_rust_symbols_and_imports_are_indexed(self) -> None:
         index = build_code_index()
         resolved = index.resolve_symbol('rust::runtime::session::Session')

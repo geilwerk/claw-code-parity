@@ -23,6 +23,26 @@ RUST_TYPED_LET_RE = re.compile(r'\blet\s+(?:mut\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*:
 RUST_PATH_LET_RE = re.compile(r'\blet\s+(?:mut\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([A-Za-z_][A-Za-z0-9_:<>]*)')
 RUST_CONTROL_CALL_HEADS = {'if', 'for', 'loop', 'match', 'return', 'while'}
 
+PYTHON_BUILTIN_QNAMES = {
+    'dict': 'python.builtins.dict',
+    'len': 'python.builtins.len',
+    'list': 'python.builtins.list',
+    'max': 'python.builtins.max',
+    'min': 'python.builtins.min',
+    'set': 'python.builtins.set',
+    'sorted': 'python.builtins.sorted',
+}
+PYTHON_CONTAINER_METHOD_QNAMES = (
+    'python.builtins.list.append',
+    'python.builtins.list.extend',
+    'python.builtins.list.pop',
+    'python.builtins.dict.get',
+    'python.builtins.dict.items',
+    'python.builtins.dict.pop',
+    'python.builtins.dict.values',
+    'python.builtins.set.add',
+)
+
 
 @dataclass(frozen=True)
 class CodeSymbol:
@@ -630,8 +650,12 @@ class _ImportAndSymbolCollector(ast.NodeVisitor):
 
     def _resolve_annotation_type(self, node: ast.AST) -> str | None:
         if isinstance(node, ast.Name):
+            if node.id in PYTHON_BUILTIN_QNAMES:
+                return PYTHON_BUILTIN_QNAMES[node.id]
             return self.aliases.get(node.id, f'{self.module}.{node.id}')
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if node.value in PYTHON_BUILTIN_QNAMES:
+                return PYTHON_BUILTIN_QNAMES[node.value]
             return self.aliases.get(node.value, f'{self.module}.{node.value}')
         if isinstance(node, ast.Subscript):
             return self._resolve_annotation_type(node.value)
@@ -699,6 +723,10 @@ class _CallCollector(ast.NodeVisitor):
             inferred = self._infer_instance_type(node.value)
             if inferred and self.local_types_stack and isinstance(node.target, ast.Name):
                 self.local_types_stack[-1][node.target.id] = inferred
+        if self.local_types_stack and isinstance(node.target, ast.Name):
+            annotated = self._resolve_annotation_type(node.annotation)
+            if annotated:
+                self.local_types_stack[-1].setdefault(node.target.id, annotated)
         self.visit(node.target)
 
     def visit_Call(self, node: ast.Call) -> None:
@@ -751,6 +779,32 @@ class _CallCollector(ast.NodeVisitor):
             return None
         return self.class_field_types.get(class_qname, {}).get(name)
 
+    def _resolve_annotation_type(self, node: ast.AST) -> str | None:
+        if isinstance(node, ast.Name):
+            if node.id in PYTHON_BUILTIN_QNAMES:
+                return PYTHON_BUILTIN_QNAMES[node.id]
+            return self.aliases.get(node.id, f'{self.module}.{node.id}')
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if node.value in PYTHON_BUILTIN_QNAMES:
+                return PYTHON_BUILTIN_QNAMES[node.value]
+            return self.aliases.get(node.value, f'{self.module}.{node.value}')
+        if isinstance(node, ast.Subscript):
+            return self._resolve_annotation_type(node.value)
+        if isinstance(node, ast.Attribute):
+            parts: list[str] = []
+            current: ast.AST | None = node
+            while isinstance(current, ast.Attribute):
+                parts.append(current.attr)
+                current = current.value
+            if isinstance(current, ast.Name):
+                parts.append(current.id)
+                dotted = '.'.join(reversed(parts))
+                head, _, tail = dotted.partition('.')
+                if head in self.aliases:
+                    return f'{self.aliases[head]}.{tail}' if tail else self.aliases[head]
+                return dotted
+        return None
+
     def _resolve_name(self, name: str) -> str | None:
         local_type = self._lookup_local_type(name)
         if local_type:
@@ -765,6 +819,8 @@ class _CallCollector(ast.NodeVisitor):
             method_name = f'{same_class}.{name}'
             if method_name in self.symbol_map:
                 return method_name
+        if name in PYTHON_BUILTIN_QNAMES:
+            return PYTHON_BUILTIN_QNAMES[name]
         return None
 
     def _resolve_callable(self, node: ast.AST) -> str | None:
@@ -796,14 +852,29 @@ class _CallCollector(ast.NodeVisitor):
             if isinstance(node.value, ast.Call):
                 instance_type = self._infer_instance_type(node.value)
                 if instance_type:
-                    return f'{instance_type}.{node.attr}'
+                    candidate = f'{instance_type}.{node.attr}'
+                    return candidate if candidate in self.symbol_map else None
+
+            instance_type = self._infer_instance_type(node.value)
+            if instance_type:
+                candidate = f'{instance_type}.{node.attr}'
+                if candidate in self.symbol_map:
+                    return candidate
 
         return None
 
     def _infer_instance_type(self, node: ast.AST) -> str | None:
+        if isinstance(node, ast.List | ast.ListComp):
+            return PYTHON_BUILTIN_QNAMES['list']
+        if isinstance(node, ast.Dict | ast.DictComp):
+            return PYTHON_BUILTIN_QNAMES['dict']
+        if isinstance(node, ast.Set | ast.SetComp):
+            return PYTHON_BUILTIN_QNAMES['set']
         if isinstance(node, ast.Name):
             resolved = self._resolve_name(node.id)
             if resolved in self.class_names:
+                return resolved
+            if resolved in PYTHON_BUILTIN_QNAMES.values():
                 return resolved
             return None
 
@@ -811,6 +882,8 @@ class _CallCollector(ast.NodeVisitor):
             if isinstance(node.func, ast.Name):
                 resolved = self._resolve_name(node.func.id)
                 if resolved in self.class_names:
+                    return resolved
+                if resolved in PYTHON_BUILTIN_QNAMES.values():
                     return resolved
             if isinstance(node.func, ast.Attribute):
                 if isinstance(node.func.value, ast.Name):
@@ -862,6 +935,21 @@ def _module_name_for_path(path: Path, package_root: Path) -> str:
     if path.name == '__init__.py':
         return '.'.join(relative.parent.parts)
     return '.'.join(relative.with_suffix('').parts)
+
+
+def _python_builtin_symbols() -> list[CodeSymbol]:
+    builtin_symbols = [
+        CodeSymbol(
+            qualified_name=qname,
+            module='python.builtins',
+            file_path='<builtin>',
+            line=0,
+            kind='builtin',
+            language='python',
+        )
+        for qname in sorted(set(PYTHON_BUILTIN_QNAMES.values()) | set(PYTHON_CONTAINER_METHOD_QNAMES))
+    ]
+    return builtin_symbols
 
 
 def _rust_module_name_for_path(path: Path) -> str:
@@ -1005,7 +1093,7 @@ def _rust_source_files() -> list[Path]:
 
 
 def _build_python_index() -> tuple[list[CodeSymbol], list[ImportEdge], list[CallEdge], list[YieldEvent]]:
-    symbols: list[CodeSymbol] = []
+    symbols: list[CodeSymbol] = _python_builtin_symbols()
     imports: list[ImportEdge] = []
     call_edges: list[CallEdge] = []
     yield_events: list[YieldEvent] = []

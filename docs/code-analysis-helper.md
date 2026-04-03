@@ -9,6 +9,7 @@ It is intentionally optimized for handoff and pressure-testing, not polished end
 - Current scope:
   - Python AST-backed symbol index
   - Python call graph
+  - Lightweight Python builtin/container-op modeling for common selection and mutation steps
   - Python literal yield-event contract extraction
   - Rust symbol index
   - Rust import graph
@@ -60,9 +61,14 @@ It is intentionally optimized for handoff and pressure-testing, not polished end
     - `src.query_engine.QueryEnginePort.persist_session`
     - `src.session_store.save_session`
 - `src.runtime.PortRuntime.route_prompt`
-  - Modeled well enough for structural routing flow.
-  - The helper correctly shows the two `_collect_matches(...)` calls.
-  - Remaining weakness is in data-shaping semantics, not core call structure.
+  - Modeled well enough to expose the routing spine plus the main selection steps.
+  - The helper now shows:
+    - the two `_collect_matches(...)` calls
+    - `python.builtins.sorted`
+    - `python.builtins.max`
+    - `python.builtins.list.append`
+    - `python.builtins.list.extend`
+  - Remaining weakness is in deeper data-shaping semantics, not the main selection flow.
 - `src.query_engine.QueryEnginePort._render_structured_output`
   - Structural call modeling is fine.
   - The remaining gap here is retry/exception semantics, not missing call edges.
@@ -89,6 +95,10 @@ It is intentionally optimized for handoff and pressure-testing, not polished end
   - Expected structure:
     - `src.runtime.PortRuntime._collect_matches`
     - `src.runtime.PortRuntime._collect_matches`
+    - `python.builtins.sorted`
+    - `python.builtins.max`
+    - `python.builtins.list.append`
+    - `python.builtins.list.extend`
 
 - `python3 -m src.main code-events src.query_engine.QueryEnginePort.stream_submit_message`
   - Expected structure:
@@ -101,10 +111,11 @@ It is intentionally optimized for handoff and pressure-testing, not polished end
 
 ## Known Gaps
 
-- Python builtins and container mutations are still mostly opaque.
-  - Example: `self.mutable_messages.append(...)` and `self.permission_denials.extend(...)` are not modeled as meaningful semantic edges.
-- Python data-shaping via comprehensions and builtins is only shallowly represented.
-  - Examples: `sorted(...)`, `max(...)`, `list.pop(...)`, `list.append(...)`, and comprehension-heavy selection logic in `route_prompt()`.
+- Python builtins and container mutations are only partially modeled.
+  - Common cases like `sorted`, `max`, `len`, `list.append`, `list.extend`, and some dict helpers are now visible.
+  - Field-backed mutations like `self.mutable_messages.append(...)` and `self.permission_denials.extend(...)` are still not first-class semantic edges.
+- Python data-shaping via comprehensions and indexed container access is still shallowly represented.
+  - Examples: comprehension-heavy selection logic in `route_prompt()`, plus cases like `by_kind[kind].pop(0)` where the indexed value type is not inferred.
 - Generator/event-schema understanding is only partial.
   - Literal `yield {...}` contracts are now modeled, but delegated yields, computed payload schemas, and branch-conditioned event presence are not first-class yet.
 - Python control-flow and branch semantics are shallow.
@@ -126,6 +137,7 @@ It is intentionally optimized for handoff and pressure-testing, not polished end
 ## Likely Next Improvements
 
 - Add Python field-backed builtin/container mutation modeling where it is semantically useful.
+- Improve local container value inference for indexed access and comprehension-heavy flows.
 - Extend the event-schema mode from literal dict yields to lightly computed payloads and conditional presence metadata.
 - Improve Rust cross-module call resolution using import aliases plus simple type propagation across more assignment patterns.
 - Add filtered graph export to files for Graphviz workflows if needed later.
